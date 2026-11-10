@@ -37,21 +37,46 @@ class SFTDataset(Dataset):
 
     def _make_example(self, prompt, answer):
         """Return shifted input_ids and labels; supervise response and EOS only."""
-        # TODO: Join prompt, response, and EOS. Shift once for next-token prediction.
-        # The first response target sits at index len(prompt) - 1.
-        raise NotImplementedError("Complete _make_example")
+        # Concatenate prompt, response, and EOS into a single tensor
+        tokens = prompt + answer + [self.tokenizer.eos_id]
+        tokens_tensor = torch.tensor(tokens, dtype=torch.long)
+        
+        # Shift exactly once for next-token prediction
+        input_ids = tokens_tensor[:-1].clone()
+        labels = tokens_tensor[1:].clone()
+        
+        # Mask the prompt tokens out of the loss calculation
+        # The first response target sits at index len(prompt) - 1
+        labels[:len(prompt) - 1] = -100
+        
+        return {"input_ids": input_ids, "labels": labels}
 
     def __len__(self):
-        # TODO: Return the number of prompt/response pairs.
-        raise NotImplementedError("Complete __len__")
+        return len(self.examples)
 
     def __getitem__(self, index):
-        # TODO: Return one example without allowing the caller to alter stored tensors.
-        raise NotImplementedError("Complete __getitem__")
+        example = self.examples[index]
+        # Return cloned tensors to prevent the caller from altering the stored dataset
+        return {
+            "input_ids": example["input_ids"].clone(),
+            "labels": example["labels"].clone()
+        }
 
     def collate_fn(self, examples):
         """Right-pad inputs with EOS, and labels with -100 (not EOS)."""
         if not examples:
             raise ValueError("Cannot collate an empty batch")
-        # TODO: Pad each field to the longest example in this batch.
-        raise NotImplementedError("Complete collate_fn")
+        
+        input_ids = [ex["input_ids"] for ex in examples]
+        labels = [ex["labels"] for ex in examples]
+        
+        # Pad inputs with the tokenizer's EOS token ID
+        padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.eos_id)
+        
+        # Pad labels with -100 so padding positions do not contribute to training loss
+        padded_labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+        
+        return {
+            "input_ids": padded_input_ids,
+            "labels": padded_labels
+        }

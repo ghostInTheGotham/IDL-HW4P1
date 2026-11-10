@@ -22,13 +22,37 @@ class LoRALinear(nn.Module):
             raise ValueError("Require positive alpha and 0 <= dropout < 1")
         self.base, self.rank, self.alpha = base, rank, float(alpha)
         self.dropout = nn.Dropout(dropout)
-        # TODO: Create trainable A and B on the base weight's device and dtype.
-        # Initialize A, zero B, and freeze the original projection.
-        raise NotImplementedError("Complete LoRALinear.__init__")
+        
+        # Freeze the original linear projection
+        for param in self.base.parameters():
+            param.requires_grad = False
+            
+        # Create trainable A and B on the base weight's device and dtype
+        # A has shape (rank, in_features)
+        self.lora_A = nn.Parameter(self.base.weight.new_empty((rank, self.base.in_features)))
+        
+        # B has shape (out_features, rank)
+        self.lora_B = nn.Parameter(self.base.weight.new_zeros((self.base.out_features, rank)))
+        
+        # Initialize A with Kaiming uniform, and B is already zeroed
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
     def forward(self, x):
-        # TODO: Add the scaled low-rank update to the original linear output.
-        raise NotImplementedError("Complete LoRALinear.forward")
+        # Compute the frozen base projection
+        base_output = self.base(x)
+        
+        # Apply dropout only to the LoRA branch
+        dropped_x = self.dropout(x)
+        
+        # Project from in_features to rank using A
+        low_rank_features = F.linear(dropped_x, self.lora_A)
+        
+        # Project from rank to out_features using B
+        lora_update = F.linear(low_rank_features, self.lora_B)
+        
+        # Scale the low-rank update and add to base output
+        scale = self.alpha / self.rank
+        return base_output + scale * lora_update
 
 
 def inject_lora(model, *, rank, alpha, dropout, targets=("q_proj", "v_proj")):
@@ -38,9 +62,54 @@ def inject_lora(model, *, rank, alpha, dropout, targets=("q_proj", "v_proj")):
     """
     if any(isinstance(m, LoRALinear) for m in model.modules()):
         raise ValueError("LoRA is already installed")
-    # TODO: Find nn.Linear leaves whose names match targets; reject any unmatched target.
-    # Build replacements before modifying the model. Freeze base parameters.
-    raise NotImplementedError("Complete inject_lora")
+        
+    # Validate the target specification
+    if isinstance(targets, str) or not targets or any(not isinstance(t, str) or not t for t in targets):
+        raise ValueError("targets must be a nonempty sequence of projection names")
+        
+    # Find nn.Linear leaves whose names match targets
+    matches = []
+    for name, module in model.named_modules():
+        leaf_name = name.split('.')[-1]
+        if isinstance(module, nn.Linear) and leaf_name in targets:
+            matches.append((name, module))
+            
+    # Reject any unmatched target
+    matched_targets = {name.split('.')[-1] for name, _ in matches}
+    missing_targets = set(targets) - matched_targets
+    if missing_targets:
+        raise ValueError(f"No linear projections found for requested targets: {missing_targets}")
+
+    # Build replacements before modifying the model
+    replacements = []
+    for name, module in matches:
+        replacement = LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout)
+        replacements.append((name, replacement))
+        
+    # Freeze every parameter in the original model
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Replace modules and enable gradients for adapter parameters
+    replaced_paths = []
+    for name, replacement in replacements:
+        parts = name.split('.')
+        parent_path = '.'.join(parts[:-1])
+        leaf_name = parts[-1]
+        
+        if not parent_path:
+            parent = model
+        else:
+            parent = model.get_submodule(parent_path)
+            
+        setattr(parent, leaf_name, replacement)
+        
+        replacement.lora_A.requires_grad = True
+        replacement.lora_B.requires_grad = True
+        
+        replaced_paths.append(name)
+        
+    return replaced_paths
 
 
 def _adapter_config(model):
@@ -49,6 +118,7 @@ def _adapter_config(model):
                    "in_features": module.base.in_features,
                    "out_features": module.base.out_features}
             for name, module in model.named_modules() if isinstance(module, LoRALinear)}
+
 
 def save_adapter(model, path: Path, metadata: dict, *, reuse=False) -> None:
     """Save current adapter tensors; reuse=True retains the previous file in history."""
@@ -69,8 +139,10 @@ def save_adapter(model, path: Path, metadata: dict, *, reuse=False) -> None:
                     None,
                 ),
             },
-            "config": _adapter_config(model), "state_dict": state,
-                    "metadata": metadata}, file)
+            "config": _adapter_config(model),
+            "state_dict": state,
+            "metadata": metadata
+        }, file)
 
 
 def load_adapter(model, path: Path, *, base_checkpoint=None) -> dict:
